@@ -1,4 +1,4 @@
-// server.js
+// C:\video-proxy\server.js
 const express = require('express');
 const fetch = require('node-fetch'); // v2
 const cors = require('cors');
@@ -21,168 +21,166 @@ function headersFor(host) {
     'Referer': `https://${host}/`,
     'Sec-Fetch-Site': 'same-origin',
     'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Dest': 'document'
+    'Sec-Fetch-User': '?1',
+    'Sec-Fetch-Dest': 'document',
   };
 }
 
-async function getText(url, extraHeaders = {}) {
-  const u = new URL(url);
-  const res = await fetch(url, {
+async function fetchHtml(urlStr) {
+  const u = new URL(urlStr);
+  const r = await fetch(urlStr, {
+    headers: headersFor(u.hostname),
     redirect: 'follow',
-    headers: { ...headersFor(u.host), ...extraHeaders }
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
-  return await res.text();
+  const html = await r.text();
+  return { status: r.status, html };
 }
 
-function pickMeta(html, name) {
-  // <meta property="og:video" content="https://...mp4">
-  const re =
-    new RegExp(`<meta[^>]+property=["']${name}["'][^>]+content=["']([^"']+)["']`, 'i');
-  const m = html.match(re);
-  return m ? m[1] : null;
-}
-
-function findJsonBlock(html) {
-  // Try to catch any JSON blob that carries media info
-  // 1) window.__additionalDataLoaded('...', {...})
-  const addRe = /__additionalDataLoaded\([^,]+,\s*(\{[\s\S]*?\})\s*\)/;
-  const m1 = html.match(addRe);
-  if (m1) return m1[1];
-
-  // 2) window\._sharedData = {...}
-  const sharedRe = /window\._sharedData\s*=\s*(\{[\s\S]*?\});/;
-  const m2 = html.match(sharedRe);
-  if (m2) return m2[1];
-
-  // 3) application/ld+json
-  const ldRe = /<script type="application\/ld\+json">([\s\S]*?)<\/script>/i;
-  const m3 = html.match(ldRe);
-  if (m3) return m3[1];
-
-  return null;
-}
-
-function deepGet(obj, pathArray) {
-  return pathArray.reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : null), obj);
-}
-
-async function extractInstagram(rawUrl) {
-  // Normalize to https and strip query noise
-  let url = rawUrl.trim();
-  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-  // ensure www
-  url = url.replace(/^https?:\/\/instagram\.com/i, 'https://www.instagram.com');
-
-  // Load page HTML
-  const html = await getText(url, {
-    'Sec-Fetch-Site': 'none',
-    'Referer': 'https://www.instagram.com/'
-  });
-
-  // 1) Simple path: og:video
-  const ogVideo = pickMeta(html, 'og:video');
-  const ogImage = pickMeta(html, 'og:image');
-  const ogTitle = pickMeta(html, 'og:title');
-
-  if (ogVideo && /\.mp4(\?|$)/i.test(ogVideo)) {
-    return {
-      ok: true,
-      source: 'instagram',
-      type: 'video',
-      video: ogVideo,
-      thumb: ogImage || null,
-      title: ogTitle || 'Instagram'
-    };
-  }
-
-  // 2) Parse embedded JSON and try common paths
-  const jsonRaw = findJsonBlock(html);
-  if (jsonRaw) {
-    try {
-      const data = JSON.parse(jsonRaw);
-
-      // Try several likely paths (IG changes structure often)
-      const candidates = [
-        // new structures
-        ['items', 0, 'video_versions', 0, 'url'],
-        ['graphql', 'shortcode_media', 'video_url'],
-        ['entry_data', 'PostPage', 0, 'graphql', 'shortcode_media', 'video_url'],
-        ['entry_data', 'PostPage', 0, 'items', 0, 'video_versions', 0, 'url'],
-        ['props', 'pageProps', 'itemInfo', 'itemStruct', 'video', 'downloadAddr'], // sometimes present
-      ];
-
-      let vid = null;
-      for (const path of candidates) {
-        vid = deepGet(data, path);
-        if (vid && typeof vid === 'string') break;
-      }
-
-      // thumbnail/title fallbacks
-      const thumb =
-        deepGet(data, ['graphql', 'shortcode_media', 'display_url']) ||
-        ogImage ||
-        null;
-
-      const title =
-        deepGet(data, ['graphql', 'shortcode_media', 'edge_media_to_caption', 'edges', 0, 'node', 'text']) ||
-        ogTitle ||
-        'Instagram';
-
-      if (vid && /\.mp4(\?|$)/i.test(vid)) {
-        return {
-          ok: true,
-          source: 'instagram',
-          type: 'video',
-          video: vid,
-          thumb,
-          title
-        };
-      }
-    } catch (_) {
-      // ignore JSON parse errors; fall through
+// follow redirects *manually* to expand share/r/* to the final URL
+async function resolveRedirectChain(urlStr, maxHops = 5) {
+  let current = urlStr;
+  for (let i = 0; i < maxHops; i++) {
+    const u = new URL(current);
+    const r = await fetch(current, {
+      headers: headersFor(u.hostname),
+      redirect: 'manual',
+    });
+    if (r.status >= 300 && r.status < 400) {
+      const loc = r.headers.get('location');
+      if (!loc) break;
+      current = new URL(loc, current).toString(); // support relative redirects
+      continue;
     }
+    return current; // not a redirect
   }
-
-  // If we got here, we couldn’t find a direct video URL
-  return {
-    ok: false,
-    source: 'instagram',
-    reason:
-      'No direct link found. The post might be private, region-locked, or requires login.'
-  };
+  return current;
 }
 
-// ===== Unified endpoint =====
-app.get('/api/extract', async (req, res) => {
-  const input = (req.query.url || '').toString().trim();
-  if (!input) return res.status(400).json({ ok: false, error: 'Missing url' });
+function altHosts(urlStr) {
+  const u = new URL(urlStr);
+  const host = u.hostname.replace(/^www\./, '');
+  if (!/facebook\.com$/i.test(host)) return [urlStr];
 
-  let host;
-  try {
-    host = new URL(/^https?:\/\//i.test(input) ? input : 'https://' + input).host;
-  } catch {
-    return res.status(400).json({ ok: false, error: 'Invalid url' });
-  }
+  // try original, then m., then mbasic.
+  const list = [urlStr];
+  const p = u.pathname + u.search + u.hash;
+
+  list.push(`https://m.facebook.com${p}`);
+  list.push(`https://mbasic.facebook.com${p}`);
+  return list;
+}
+
+app.get('/api/fetch', async (req, res) => {
+  let target = req.query.url;
+  if (!target) return res.status(400).json({ error: 'No url query provided' });
 
   try {
-    if (/instagram\.com$/i.test(host) || /(^|\.)(instagram\.com)$/i.test(host)) {
-      const out = await extractInstagram(input);
-      if (!out.ok) return res.status(422).json(out);
-      return res.json(out);
+    // 1) expand share/r/* to the final target if it’s a FB share link
+    const host = new URL(target).hostname.replace(/^www\./, '');
+    if (/facebook\.com$/i.test(host) && /\/share\//i.test(target)) {
+      target = await resolveRedirectChain(target);
     }
 
-    // Existing handlers (Facebook, TikTok, X) go here…
-    // else if (/facebook\.com$/i.test(host)) { ... }
+    // 2) try original → m. → mbasic.
+    const candidates = altHosts(target);
+    let okHtml = '';
+    for (const candidate of candidates) {
+      try {
+        const r = await fetchHtml(candidate);
+        if (r.status < 400 && !/Sorry[^<]{0,50}went wrong/i.test(r.html)) {
+          okHtml = r.html;
+          break;
+        }
+      } catch (_) {}
+    }
 
-    return res
-      .status(400)
-      .json({ ok: false, error: 'Unsupported host for now', host });
+    if (!okHtml) {
+      return res
+        .status(502)
+        .type('text/plain')
+        .send('Upstream returned an error page or required login.');
+    }
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.status(200).send(okHtml);
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message || 'Server error' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(process.env.PORT || 3000, () =>
-  console.log('video proxy running on :3000')
-);
+/* -----------------------
+   New: streaming downloader
+   ----------------------- */
+
+// Try to get a usable filename from headers/path
+function pickFilename(upstreamUrl, r) {
+  // 1) Content-Disposition filename
+  const cd = r.headers.get('content-disposition') || '';
+  const m = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+  if (m && m[1]) {
+    try { return decodeURIComponent(m[1]); } catch { return m[1]; }
+  }
+
+  // 2) last path segment
+  try {
+    const u = new URL(upstreamUrl);
+    const last = (u.pathname.split('/').pop() || '').split('?')[0];
+    if (last) {
+      // ensure .mp4 if looks like a raw blob
+      if (/\.(mp4|mov|m4v|webm)$/i.test(last)) return last;
+      return `${last}.mp4`;
+    }
+  } catch {}
+
+  // 3) fallback
+  return 'video.mp4';
+}
+
+app.get('/api/download', async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).send('Missing url');
+
+  try {
+    const u = new URL(targetUrl);
+    // Forward Range (resume/seek) & use media-friendly UA
+    const dlHeaders = {
+      ...headersFor(u.hostname),
+      'Accept': '*/*'
+    };
+    const clientRange = req.headers.range;
+    if (clientRange) dlHeaders['Range'] = clientRange;
+
+    const r = await fetch(targetUrl, {
+      headers: dlHeaders,
+      redirect: 'follow',
+    });
+
+    // Propagate important headers
+    const ct = r.headers.get('content-type') || 'application/octet-stream';
+    const cl = r.headers.get('content-length');
+    const cr = r.headers.get('content-range');
+    const ar = r.headers.get('accept-ranges');
+
+    res.setHeader('Content-Type', ct);
+    if (cl) res.setHeader('Content-Length', cl);
+    if (cr) res.setHeader('Content-Range', cr);
+    if (ar) res.setHeader('Accept-Ranges', ar);
+
+    const filename = pickFilename(targetUrl, r);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // Use upstream status (200/206)
+    res.status(r.status);
+    r.body.pipe(res);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Download failed');
+  }
+});
+
+app.get('/', (_req, res) => {
+  res.type('text/plain').send('Video proxy is running. Use /api/fetch?url=... and /api/download?url=...');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Proxy running at http://localhost:${PORT}`));
